@@ -538,6 +538,9 @@ impl ExtensionManager {
         Self::validate_extension_name(name)?;
         let kind = self.determine_installed_kind(name).await?;
 
+        // Clean up secrets before deleting capabilities files
+        self.cleanup_extension_secrets(name, kind).await;
+
         match kind {
             ExtensionKind::McpServer => {
                 // Unregister tools with this server's prefix
@@ -2128,32 +2131,70 @@ impl ExtensionManager {
             return Ok(AuthResult::authenticated(name, ExtensionKind::WasmChannel));
         }
 
-        // If a token was provided, store it for the first missing secret
+        // If a token was provided, delegate to save_setup_secrets for
+        // validation, auto-generation, and activation (unified path).
+        // Note: save_setup_secrets also calls activate_wasm_channel internally,
+        // so the caller's subsequent activate() call is a harmless refresh.
         if let Some(token_value) = token {
             let secret = &missing[0];
-            let params =
-                CreateSecretParams::new(&secret.name, token_value).with_provider(name.to_string());
-            self.secrets
-                .create(&self.user_id, params)
-                .await
-                .map_err(|e| ExtensionError::AuthFailed(e.to_string()))?;
+            let mut secrets_map = std::collections::HashMap::new();
+            secrets_map.insert(secret.name.clone(), token_value.to_string());
 
-            // Check if there are more missing secrets
-            if missing.len() <= 1 {
-                return Ok(AuthResult::authenticated(name, ExtensionKind::WasmChannel));
+            match self.save_setup_secrets(name, &secrets_map).await {
+                Ok(_result) => {
+                    // Re-check for remaining missing secrets
+                    let mut still_missing = Vec::new();
+                    for s in required_secrets {
+                        if s.optional {
+                            continue;
+                        }
+                        if !self
+                            .secrets
+                            .exists(&self.user_id, &s.name)
+                            .await
+                            .unwrap_or(false)
+                        {
+                            still_missing.push(s);
+                        }
+                    }
+
+                    if still_missing.is_empty() {
+                        return Ok(AuthResult::authenticated(name, ExtensionKind::WasmChannel));
+                    }
+
+                    let next = &still_missing[0];
+                    return Ok(AuthResult::awaiting_token(
+                        name,
+                        ExtensionKind::WasmChannel,
+                        next.prompt.clone(),
+                        cap_file.setup.setup_url.clone(),
+                    ));
+                }
+                Err(e) => {
+                    // Token validation errors (bad token, API rejected) should
+                    // re-prompt the user. Infrastructure errors (DB down, file
+                    // read failure) should propagate to the caller.
+                    let msg = e.to_string();
+                    if msg.contains("Invalid token")
+                        || msg.contains("API returned")
+                        || msg.contains("validate token")
+                    {
+                        return Ok(AuthResult::awaiting_token(
+                            name,
+                            ExtensionKind::WasmChannel,
+                            format!(
+                                "Authentication failed: {}. Please provide a valid token.",
+                                e
+                            ),
+                            cap_file.setup.setup_url.clone(),
+                        ));
+                    }
+                    return Err(e);
+                }
             }
-
-            // More secrets needed; prompt for the next one
-            let next = &missing[1];
-            return Ok(AuthResult::awaiting_token(
-                name,
-                ExtensionKind::WasmChannel,
-                next.prompt.clone(),
-                cap_file.setup.setup_url.clone(),
-            ));
         }
 
-        // Prompt for the first missing secret
+        // No token provided: prompt for the first missing secret
         let secret = &missing[0];
         Ok(AuthResult::awaiting_token(
             name,
@@ -2873,32 +2914,46 @@ impl ExtensionManager {
             }
         };
 
-        // For Telegram, validate the bot token against the API before storing it.
-        // This catches bad tokens immediately (both on first setup and reconfigure),
-        // before the channel activates and potentially shows as active with a bad token.
-        if name == "telegram"
-            && let Some(token_value) = secrets.get("telegram_bot_token")
-        {
-            let token = token_value.trim();
-            if !token.is_empty() {
-                let encoded_token =
-                    url::form_urlencoded::byte_serialize(token.as_bytes()).collect::<String>();
-                let url = format!("https://api.telegram.org/bot{}/getMe", encoded_token);
-                let resp = reqwest::Client::builder()
-                    .timeout(std::time::Duration::from_secs(10))
-                    .build()
-                    .map_err(|e| ExtensionError::Other(e.to_string()))?
-                    .get(&url)
-                    .send()
-                    .await
-                    .map_err(|e| {
-                        ExtensionError::Other(format!("Failed to validate bot token: {}", e))
-                    })?;
-                if !resp.status().is_success() {
-                    return Err(ExtensionError::Other(format!(
-                        "Invalid bot token (Telegram API returned {})",
-                        resp.status()
-                    )));
+        // Validate secrets against the validation_endpoint if declared in capabilities.
+        // The endpoint URL template uses {secret_name} placeholders that are
+        // substituted with the provided secret value before making the request.
+        if kind == ExtensionKind::WasmChannel {
+            let cap_path = self
+                .wasm_channels_dir
+                .join(format!("{}.capabilities.json", name));
+            if let Ok(cap_bytes) = tokio::fs::read(&cap_path).await
+                && let Ok(cap_file) =
+                    crate::channels::wasm::ChannelCapabilitiesFile::from_bytes(&cap_bytes)
+                && let Some(ref endpoint_template) = cap_file.setup.validation_endpoint
+                && let Some(secret_def) = cap_file
+                    .setup
+                    .required_secrets
+                    .iter()
+                    .find(|s| !s.optional && secrets.contains_key(&s.name))
+                && let Some(token_value) = secrets.get(&secret_def.name)
+            {
+                let token = token_value.trim();
+                if !token.is_empty() {
+                    let encoded =
+                        url::form_urlencoded::byte_serialize(token.as_bytes()).collect::<String>();
+                    let url =
+                        endpoint_template.replace(&format!("{{{}}}", secret_def.name), &encoded);
+                    let resp = reqwest::Client::builder()
+                        .timeout(std::time::Duration::from_secs(10))
+                        .build()
+                        .map_err(|e| ExtensionError::Other(e.to_string()))?
+                        .get(&url)
+                        .send()
+                        .await
+                        .map_err(|e| {
+                            ExtensionError::Other(format!("Failed to validate token: {}", e))
+                        })?;
+                    if !resp.status().is_success() {
+                        return Err(ExtensionError::Other(format!(
+                            "Invalid token (API returned {})",
+                            resp.status()
+                        )));
+                    }
                 }
             }
         }
@@ -2994,8 +3049,10 @@ impl ExtensionManager {
 
                     // Check if auth is needed (OAuth or manual token).
                     // This is safe to call here — cancel-and-retry prevents port conflicts.
+                    // Box::pin breaks the async recursion cycle:
+                    // auth() → auth_wasm_channel() → save_setup_secrets() → auth()
                     let mut auth_url = None;
-                    if let Ok(auth_result) = self.auth(name, None).await {
+                    if let Ok(auth_result) = Box::pin(self.auth(name, None)).await {
                         auth_url = auth_result.auth_url().map(String::from);
                     }
                     let message = if auth_url.is_some() {
@@ -3106,6 +3163,100 @@ impl ExtensionManager {
             tracing::info!(
                 secrets = ?secret_names,
                 "Revoked credential mappings for removed extension"
+            );
+        }
+    }
+
+    /// Delete all secrets associated with an extension.
+    ///
+    /// Uses two strategies:
+    /// 1. Read secret names from the capabilities file (while it still exists)
+    /// 2. Fallback: list all secrets where `provider == extension_name`
+    async fn cleanup_extension_secrets(&self, name: &str, kind: ExtensionKind) {
+        let mut deleted_names: Vec<String> = Vec::new();
+
+        match kind {
+            ExtensionKind::WasmChannel => {
+                let cap_path = self
+                    .wasm_channels_dir
+                    .join(format!("{}.capabilities.json", name));
+                if let Ok(bytes) = tokio::fs::read(&cap_path).await
+                    && let Ok(cap_file) =
+                        crate::channels::wasm::ChannelCapabilitiesFile::from_bytes(&bytes)
+                {
+                    for secret in &cap_file.setup.required_secrets {
+                        if self.secrets.delete(&self.user_id, &secret.name).await.ok() == Some(true)
+                        {
+                            deleted_names.push(secret.name.clone());
+                        }
+                    }
+                    // Also clean up auto-generated secrets (e.g., webhook secret)
+                    if let Some(ref webhook) = cap_file
+                        .capabilities
+                        .channel
+                        .as_ref()
+                        .and_then(|c| c.webhook.as_ref())
+                        .and_then(|w| w.secret_name.clone())
+                        && self.secrets.delete(&self.user_id, webhook).await.ok() == Some(true)
+                    {
+                        deleted_names.push(webhook.clone());
+                    }
+                }
+            }
+            ExtensionKind::WasmTool => {
+                if let Some(cap) = self.load_tool_capabilities(name).await {
+                    if let Some(ref auth) = cap.auth {
+                        for suffix in ["", "_scopes", "_refresh_token"] {
+                            let secret_name = if suffix.is_empty() {
+                                auth.secret_name.clone()
+                            } else {
+                                format!("{}{}", auth.secret_name, suffix)
+                            };
+                            if self.secrets.delete(&self.user_id, &secret_name).await.ok()
+                                == Some(true)
+                            {
+                                deleted_names.push(secret_name);
+                            }
+                        }
+                    }
+                    if let Some(ref setup) = cap.setup {
+                        for secret in &setup.required_secrets {
+                            if self.secrets.delete(&self.user_id, &secret.name).await.ok()
+                                == Some(true)
+                            {
+                                deleted_names.push(secret.name.clone());
+                            }
+                        }
+                    }
+                }
+            }
+            ExtensionKind::McpServer => {
+                for suffix in ["access_token", "refresh_token"] {
+                    let secret_name = format!("mcp_{}_{}", name, suffix);
+                    if self.secrets.delete(&self.user_id, &secret_name).await.ok() == Some(true) {
+                        deleted_names.push(secret_name);
+                    }
+                }
+            }
+        }
+
+        // Fallback: delete any secrets tagged with this provider
+        if let Ok(all_refs) = self.secrets.list(&self.user_id).await {
+            for secret_ref in all_refs {
+                if secret_ref.provider.as_deref() == Some(name)
+                    && !deleted_names.contains(&secret_ref.name)
+                {
+                    let _ = self.secrets.delete(&self.user_id, &secret_ref.name).await;
+                    deleted_names.push(secret_ref.name);
+                }
+            }
+        }
+
+        if !deleted_names.is_empty() {
+            tracing::info!(
+                extension = name,
+                secrets = ?deleted_names,
+                "Cleaned up secrets for removed extension"
             );
         }
     }
@@ -3514,5 +3665,208 @@ mod tests {
         // Both exist with distinct content.
         assert_eq!(std::fs::read_to_string(&tool_cap).unwrap(), tool_caps);
         assert_eq!(std::fs::read_to_string(&channel_cap).unwrap(), channel_caps);
+    }
+
+    // === Secret cleanup on remove tests ===
+
+    fn make_test_manager_with_dirs(
+        tools_dir: std::path::PathBuf,
+        channels_dir: std::path::PathBuf,
+    ) -> (
+        crate::extensions::manager::ExtensionManager,
+        Arc<dyn crate::secrets::SecretsStore + Send + Sync>,
+    ) {
+        use crate::secrets::{InMemorySecretsStore, SecretsCrypto};
+        use crate::tools::mcp::session::McpSessionManager;
+
+        let key = secrecy::SecretString::from(crate::secrets::keychain::generate_master_key_hex());
+        let crypto = Arc::new(SecretsCrypto::new(key).expect("crypto"));
+        let secrets: Arc<dyn crate::secrets::SecretsStore + Send + Sync> =
+            Arc::new(InMemorySecretsStore::new(crypto));
+        let tools = Arc::new(crate::tools::ToolRegistry::new());
+        let mcp = Arc::new(McpSessionManager::new());
+
+        let mgr = crate::extensions::manager::ExtensionManager::new(
+            mcp,
+            Arc::clone(&secrets),
+            tools,
+            None,
+            None,
+            tools_dir,
+            channels_dir,
+            None,
+            "test".to_string(),
+            None,
+            vec![],
+        );
+        (mgr, secrets)
+    }
+
+    #[tokio::test]
+    async fn test_remove_channel_cleans_up_secrets() {
+        use crate::secrets::CreateSecretParams;
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let tools_dir = dir.path().join("tools");
+        let channels_dir = dir.path().join("channels");
+        std::fs::create_dir_all(&tools_dir).unwrap();
+        std::fs::create_dir_all(&channels_dir).unwrap();
+
+        let (mgr, secrets) = make_test_manager_with_dirs(tools_dir, channels_dir.clone());
+
+        let cap_json = r#"{
+            "type": "channel",
+            "name": "testchan",
+            "setup": {
+                "required_secrets": [
+                    { "name": "testchan_bot_token", "prompt": "token", "optional": false }
+                ]
+            },
+            "capabilities": {
+                "channel": {
+                    "allowed_paths": ["/webhook/testchan"],
+                    "webhook": {
+                        "secret_name": "testchan_webhook_secret"
+                    }
+                }
+            }
+        }"#;
+        std::fs::write(channels_dir.join("testchan.capabilities.json"), cap_json).unwrap();
+        std::fs::write(channels_dir.join("testchan.wasm"), b"fake-wasm").unwrap();
+
+        secrets
+            .create(
+                "test",
+                CreateSecretParams::new("testchan_bot_token", "tok123")
+                    .with_provider("testchan".to_string()),
+            )
+            .await
+            .unwrap();
+        secrets
+            .create(
+                "test",
+                CreateSecretParams::new("testchan_webhook_secret", "whsec")
+                    .with_provider("testchan".to_string()),
+            )
+            .await
+            .unwrap();
+
+        assert!(secrets.exists("test", "testchan_bot_token").await.unwrap());
+        assert!(
+            secrets
+                .exists("test", "testchan_webhook_secret")
+                .await
+                .unwrap()
+        );
+
+        mgr.remove("testchan").await.unwrap();
+
+        assert!(
+            !secrets.exists("test", "testchan_bot_token").await.unwrap(),
+            "Bot token should be deleted after remove"
+        );
+        assert!(
+            !secrets
+                .exists("test", "testchan_webhook_secret")
+                .await
+                .unwrap(),
+            "Webhook secret should be deleted after remove"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_remove_cleans_secrets_by_provider_fallback() {
+        use crate::secrets::CreateSecretParams;
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let tools_dir = dir.path().join("tools");
+        let channels_dir = dir.path().join("channels");
+        std::fs::create_dir_all(&tools_dir).unwrap();
+        std::fs::create_dir_all(&channels_dir).unwrap();
+
+        let (mgr, secrets) = make_test_manager_with_dirs(tools_dir, channels_dir.clone());
+
+        let cap_json = r#"{
+            "type": "channel",
+            "name": "minichan",
+            "capabilities": {}
+        }"#;
+        std::fs::write(channels_dir.join("minichan.capabilities.json"), cap_json).unwrap();
+        std::fs::write(channels_dir.join("minichan.wasm"), b"fake-wasm").unwrap();
+
+        secrets
+            .create(
+                "test",
+                CreateSecretParams::new("minichan_custom_key", "val")
+                    .with_provider("minichan".to_string()),
+            )
+            .await
+            .unwrap();
+
+        assert!(secrets.exists("test", "minichan_custom_key").await.unwrap());
+
+        mgr.remove("minichan").await.unwrap();
+
+        assert!(
+            !secrets.exists("test", "minichan_custom_key").await.unwrap(),
+            "Provider-tagged secret should be cleaned up by fallback"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_auth_after_reinstall_detects_missing_secrets() {
+        use crate::secrets::CreateSecretParams;
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let tools_dir = dir.path().join("tools");
+        let channels_dir = dir.path().join("channels");
+        std::fs::create_dir_all(&tools_dir).unwrap();
+        std::fs::create_dir_all(&channels_dir).unwrap();
+
+        let (mgr, secrets) = make_test_manager_with_dirs(tools_dir, channels_dir.clone());
+
+        let cap_json = r#"{
+            "type": "channel",
+            "name": "testbot",
+            "setup": {
+                "required_secrets": [
+                    { "name": "testbot_token", "prompt": "Bot token", "optional": false }
+                ]
+            },
+            "capabilities": {}
+        }"#;
+
+        std::fs::write(channels_dir.join("testbot.capabilities.json"), cap_json).unwrap();
+        std::fs::write(channels_dir.join("testbot.wasm"), b"fake-wasm").unwrap();
+        secrets
+            .create(
+                "test",
+                CreateSecretParams::new("testbot_token", "old-invalid-token")
+                    .with_provider("testbot".to_string()),
+            )
+            .await
+            .unwrap();
+
+        let result = mgr.auth("testbot", None).await.unwrap();
+        assert!(
+            result.is_authenticated(),
+            "Should be authenticated before remove"
+        );
+
+        mgr.remove("testbot").await.unwrap();
+
+        // "Reinstall"
+        std::fs::write(channels_dir.join("testbot.capabilities.json"), cap_json).unwrap();
+        std::fs::write(channels_dir.join("testbot.wasm"), b"fake-wasm").unwrap();
+
+        let result = mgr.auth("testbot", None).await.unwrap();
+        assert!(
+            !result.is_authenticated(),
+            "After remove+reinstall, auth should not report authenticated"
+        );
+        assert!(
+            result.instructions().is_some(),
+            "Should prompt for token after reinstall"
+        );
     }
 }
