@@ -230,6 +230,7 @@ impl LlmConfig {
             ollama: None,
             openai_compatible: None,
             tinfoil: None,
+            request_timeout_secs: 120,
         }
     }
 

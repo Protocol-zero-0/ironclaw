@@ -57,9 +57,7 @@ pub fn create_llm_provider(
 ) -> Result<Arc<dyn LlmProvider>, LlmError> {
     let timeout = config.request_timeout_secs;
     match config.backend {
-        LlmBackend::NearAi => {
-            create_llm_provider_with_config(&config.nearai, session, timeout)
-        }
+        LlmBackend::NearAi => create_llm_provider_with_config(&config.nearai, session, timeout),
         LlmBackend::OpenAi => create_openai_provider(config),
         LlmBackend::Anthropic => create_anthropic_provider(config),
         LlmBackend::Ollama => create_ollama_provider(config),
@@ -387,7 +385,11 @@ pub fn build_provider_chain(
     let llm: Arc<dyn LlmProvider> = if let Some(ref cheap_model) = config.nearai.cheap_model {
         let mut cheap_config = config.nearai.clone();
         cheap_config.model = cheap_model.clone();
-        let cheap = create_llm_provider_with_config(&cheap_config, session.clone(), config.request_timeout_secs)?;
+        let cheap = create_llm_provider_with_config(
+            &cheap_config,
+            session.clone(),
+            config.request_timeout_secs,
+        )?;
         let cheap: Arc<dyn LlmProvider> = if retry_config.max_retries > 0 {
             Arc::new(RetryProvider::new(cheap, retry_config.clone()))
         } else {
@@ -419,7 +421,11 @@ pub fn build_provider_chain(
         }
         let mut fallback_config = config.nearai.clone();
         fallback_config.model = fallback_model.clone();
-        let fallback = create_llm_provider_with_config(&fallback_config, session.clone(), config.request_timeout_secs)?;
+        let fallback = create_llm_provider_with_config(
+            &fallback_config,
+            session.clone(),
+            config.request_timeout_secs,
+        )?;
         tracing::info!(
             primary = %llm.model_name(),
             fallback = %fallback.model_name(),
